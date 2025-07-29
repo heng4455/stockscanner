@@ -11,39 +11,68 @@ interface RowData {
   quantity: number;
 }
 
-const emptyRow: RowData = { model_name: '', lot: '', quantity: 0 };
+const emptyRow: RowData = { model_name: '', lot: '', quantity: 1 };
 
 const QRCreator: React.FC = () => {
   const [rows, setRows] = useState<RowData[]>([{ ...emptyRow }]);
   const [showQR, setShowQR] = useState<number | null>(null);
 
-  const generateWordDocument = async () => {
-    try {
-      const response = await fetch('http://localhost:3000/generate-word', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ qrData: rows }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'qrcodes.docx';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(url);
-    } catch (error) {
-      console.error('Error generating Word document:', error);
-      alert('เกิดข้อผิดพลาดในการสร้างไฟล์ Word');
+  const processBoxColumn = (boxValue: string | number, baseRow: RowData): RowData[] => {
+    const results: RowData[] = [];
+    
+    if (!boxValue) {
+      return [baseRow];
     }
+    
+    const boxStr = String(boxValue).trim();
+    
+    // กรณีพิเศษ: ถ้า quantity เป็น "-" และ box เป็นตัวเลข 
+    // ให้สร้าง 1 row โดยใช้ค่า box เป็น quantity
+    if (baseRow.quantity === 0 || String(baseRow.quantity) === '-' || baseRow.quantity < 0) {
+      const boxAsQuantity = parseInt(boxStr);
+      if (!isNaN(boxAsQuantity) && boxAsQuantity > 0) {
+        return [{
+          ...baseRow,
+          quantity: boxAsQuantity
+        }];
+      }
+    }
+    
+    // ตรวจสอบว่าเป็นรูปแบบ "10+2000" หรือไม่
+    if (boxStr.includes('+')) {
+      const parts = boxStr.split('+');
+      if (parts.length === 2) {
+        const firstCount = parseInt(parts[0].trim());
+        const secondQuantity = parseInt(parts[1].trim());
+        
+        if (!isNaN(firstCount) && !isNaN(secondQuantity)) {
+          // สร้าง row ซ้ำตามจำนวนแรก (เช่น 10 ครั้ง)
+          for (let i = 0; i < firstCount; i++) {
+            results.push({ ...baseRow });
+          }
+          
+          // สร้าง row เพิ่มเติม 1 อันโดยใส่จำนวนเป็นตัวเลขที่สอง (เช่น 2000)
+          results.push({
+            ...baseRow,
+            quantity: secondQuantity
+          });
+          
+          return results;
+        }
+      }
+    }
+    
+    // ถ้าเป็นตัวเลขธรรมดา ให้สร้าง row ซ้ำตามจำนวนนั้น
+    const boxCount = parseInt(boxStr);
+    if (!isNaN(boxCount) && boxCount > 0) {
+      for (let i = 0; i < boxCount; i++) {
+        results.push({ ...baseRow });
+      }
+      return results;
+    }
+    
+    // ถ้าไม่ใช่ตัวเลข ให้ return row เดิม
+    return [baseRow];
   };
 
   const handleExcelImport = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -58,12 +87,39 @@ const QRCreator: React.FC = () => {
       const worksheet = workbook.Sheets[sheetName];
       const json = XLSX.utils.sheet_to_json(worksheet) as any[];
 
-      const importedRows: RowData[] = json.map(row => ({
-        model_name: row.Item ? String(row.Item) : '',
-        lot: row.Lot ? String(row.Lot) : '',
-        quantity: row.Qty ? Number(row.Qty) : 1,
-      }));
-      setRows(importedRows.length > 0 ? importedRows : [{ ...emptyRow }]);
+      const processedRows: RowData[] = [];
+      
+      json.forEach(row => {
+        // จัดการค่า Qty ที่อาจเป็น "-" หรือค่าอื่นๆ
+        let quantity = 1;
+        if (row.Qty) {
+          const qtyStr = String(row.Qty).trim();
+          if (qtyStr === '-' || qtyStr === '') {
+            quantity = 0; // ใช้ 0 เป็นสัญญาณว่าให้ใช้ค่าจาก Box แทน
+          } else {
+            // ลบ comma ออกจากตัวเลข เช่น "18,000" -> "18000"
+            const cleanQty = qtyStr.replace(/,/g, '');
+            const parsedQty = Number(cleanQty);
+            quantity = !isNaN(parsedQty) ? parsedQty : 1;
+          }
+        }
+
+        const baseRow: RowData = {
+          model_name: row.Item ? String(row.Item) : '',
+          lot: row.Lot ? String(row.Lot) : '',
+          quantity: quantity,
+        };
+        
+        // ประมวลผล column Box
+        const boxValue = row.Box || row.box || row.BOX;
+        const expandedRows = processBoxColumn(boxValue, baseRow);
+        processedRows.push(...expandedRows);
+      });
+      
+      setRows(processedRows.length > 0 ? processedRows : [{ ...emptyRow }]);
+      
+      // Reset input value เพื่อให้สามารถ import ไฟล์เดิมได้อีก
+      event.target.value = '';
     };
     reader.readAsArrayBuffer(file);
   };
@@ -75,23 +131,85 @@ const QRCreator: React.FC = () => {
     const reader = new FileReader();
     reader.onload = (e) => {
       const csv = e.target?.result as string;
-      const rowsData = csv.split(/\r?\n/).map(row => row.split(','));
-      const headers = rowsData[0];
-      const dataRows = rowsData.slice(1);
+      
+      // ปรับปรุงการ parse CSV เพื่อจัดการกับ quotes และ comma ภายในเซลล์
+      const parseCSVLine = (line: string): string[] => {
+        const result: string[] = [];
+        let current = '';
+        let inQuotes = false;
+        
+        for (let i = 0; i < line.length; i++) {
+          const char = line[i];
+          
+          if (char === '"') {
+            // ตรวจสอบ double quotes ("")
+            if (line[i + 1] === '"') {
+              current += '"';
+              i++; // skip next quote
+            } else {
+              inQuotes = !inQuotes;
+            }
+          } else if (char === ',' && !inQuotes) {
+            result.push(current.trim());
+            current = '';
+          } else {
+            current += char;
+          }
+        }
+        
+        result.push(current.trim());
+        return result;
+      };
+      
+      const lines = csv.split(/\r?\n/);
+      const headers = parseCSVLine(lines[0]);
+      const dataRows = lines.slice(1).filter(line => line.trim() !== '');
 
-      const importedRows: RowData[] = dataRows.map(row => {
+      const processedRows: RowData[] = [];
+
+      dataRows.forEach(line => {
+        const row = parseCSVLine(line);
         const rowDataItem: { [key: string]: string } = {};
+        
         headers.forEach((header, index) => {
-          rowDataItem[header.trim()] = row[index] ? row[index].trim() : '';
+          // ลบ quotes ออกจากข้อมูลถ้ามี
+          let value = row[index] || '';
+          if (value.startsWith('"') && value.endsWith('"')) {
+            value = value.slice(1, -1);
+          }
+          rowDataItem[header.trim()] = value.trim();
         });
 
-        return {
+        // จัดการค่า Qty ที่อาจเป็น "-" หรือค่าอื่นๆ
+        let quantity = 1;
+        if (rowDataItem.Qty) {
+          const qtyStr = String(rowDataItem.Qty).trim();
+          if (qtyStr === '-' || qtyStr === '') {
+            quantity = 0; // ใช้ 0 เป็นสัญญาณว่าให้ใช้ค่าจาก Box แทน
+          } else {
+            // ลบ comma ออกจากตัวเลข เช่น "47,800" -> "47800"
+            const cleanQty = qtyStr.replace(/,/g, '');
+            const parsedQty = Number(cleanQty);
+            quantity = !isNaN(parsedQty) ? parsedQty : 1;
+          }
+        }
+
+        const baseRow: RowData = {
           model_name: rowDataItem.Item ? String(rowDataItem.Item) : '',
           lot: rowDataItem.Lot ? String(rowDataItem.Lot) : '',
-          quantity: rowDataItem.Qty ? Number(rowDataItem.Qty) : 1,
+          quantity: quantity,
         };
+        
+        // ประมวลผล column Box
+        const boxValue = rowDataItem.Box || rowDataItem.box || rowDataItem.BOX;
+        const expandedRows = processBoxColumn(boxValue, baseRow);
+        processedRows.push(...expandedRows);
       });
-      setRows(importedRows.length > 0 ? importedRows : [{ ...emptyRow }]);
+      
+      setRows(processedRows.length > 0 ? processedRows : [{ ...emptyRow }]);
+      
+      // Reset input value เพื่อให้สามารถ import ไฟล์เดิมได้อีก
+      event.target.value = '';
     };
     reader.readAsText(file);
   };
@@ -109,7 +227,6 @@ const QRCreator: React.FC = () => {
   const addRow = () => setRows([...rows, { ...emptyRow }]);
   const removeRow = (idx: number) => {
     if (rows.length === 1) {
-      // ถ้าเหลือแถวเดียว ให้เคลียร์ข้อมูล ไม่ลบ row
       setRows([{ ...emptyRow }]);
     } else {
       setRows(rows.filter((_, i) => i !== idx));
@@ -140,11 +257,12 @@ const QRCreator: React.FC = () => {
     const zip = new JSZip();
     for (let idx = 0; idx < rows.length; idx++) {
       const qrValue = JSON.stringify(rows[idx]);
-      // สร้าง PNG base64
       const dataUrl = await QRCodePNG.toDataURL(qrValue, { errorCorrectionLevel: 'H', width: 300 });
-      // แปลง base64 เป็น binary
       const base64 = dataUrl.split(',')[1];
-      zip.file(`${idx + 1}.png`, base64, { base64: true });
+      const safeModel = rows[idx].model_name.replace(/[^a-zA-Z0-9ก-๙_.-]/g, '_');
+      const safeLot = rows[idx].lot.replace(/[^a-zA-Z0-9ก-๙_.-]/g, '_');
+      const fileName = `${idx + 1}_${safeModel}_${safeLot}.png`;
+      zip.file(fileName, base64, { base64: true });
     }
     const content = await zip.generateAsync({ type: 'blob' });
     saveAs(content, 'qrcodes.zip');
@@ -177,24 +295,24 @@ const QRCreator: React.FC = () => {
                 <React.Fragment key={idx}>
                   <tr style={{ background: idx % 2 ? '#f5fafd' : undefined }}>
                     <td style={{ padding: 10, textAlign: 'center' }}>{idx + 1}</td>
-                  <td style={{ padding: 10 }}>
-                    <input value={row.model_name} onChange={e => handleChange(idx, 'model_name', e.target.value)} style={{ width: '100%' }} />
-                  </td>
-                  <td style={{ padding: 10 }}>
-                    <input value={row.lot} onChange={e => handleChange(idx, 'lot', e.target.value)} style={{ width: '100%' }} />
-                  </td>
-                  <td style={{ padding: 10 }}>
-                    <input type="number" min={1} value={row.quantity} onChange={e => handleChange(idx, 'quantity', e.target.value)} style={{ width: 80 }} />
-                  </td>
-                  <td style={{ padding: 10 }}>
+                    <td style={{ padding: 10 }}>
+                      <input value={row.model_name} onChange={e => handleChange(idx, 'model_name', e.target.value)} style={{ width: '100%' }} />
+                    </td>
+                    <td style={{ padding: 10 }}>
+                      <input value={row.lot} onChange={e => handleChange(idx, 'lot', e.target.value)} style={{ width: '100%' }} />
+                    </td>
+                    <td style={{ padding: 10 }}>
+                      <input type="number" min={1} value={row.quantity} onChange={e => handleChange(idx, 'quantity', e.target.value)} style={{ width: 80 }} />
+                    </td>
+                    <td style={{ padding: 10 }}>
                       <button
                         onClick={() => setShowQR(idx)}
                         style={{ background: '#1976d2', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 12px', fontWeight: 600, cursor: 'pointer' }}
                       >
                         สร้าง QR Code
                       </button>
-                  </td>
-                  <td style={{ padding: 10 }}>
+                    </td>
+                    <td style={{ padding: 10 }}>
                       <button onClick={() => removeRow(idx)} style={{ background: '#d32f2f', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 12px', fontWeight: 600, cursor: 'pointer' }}>ลบ</button>
                     </td>
                   </tr>
@@ -205,8 +323,8 @@ const QRCreator: React.FC = () => {
                         <div style={{ marginTop: 8 }}>
                           <button onClick={() => downloadQR(idx)} style={{ background: '#388e3c', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 12px', fontWeight: 600, cursor: 'pointer' }}>ดาวน์โหลด QR</button>
                         </div>
-                  </td>
-                </tr>
+                      </td>
+                    </tr>
                   )}
                 </React.Fragment>
               ))}
@@ -281,7 +399,6 @@ const QRCreator: React.FC = () => {
             marginLeft: '16px',
           }}
         >Import CSV</button>
-        {/* Removed showQR section as it's now handled by backend */}
       </div>
     </div>
   );
